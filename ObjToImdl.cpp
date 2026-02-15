@@ -1,0 +1,1164 @@
+﻿// ObjToIma.cpp : このファイルには 'main' 関数が含まれています。プログラム実行の開始と終了がそこで行われます。
+// wavefront形式のファイルを独自形式のモデルデータに変換するツール
+
+// ------------------------------------------------------------ //
+// モデルデータフォーマット
+//
+// ファイルヘッダ (FileHeader)
+//   uint32_t magic      // 'IMDL'
+//   uint32_t version    // 1
+//   uint32_t chunkCount // 5
+//
+// ----- チャンク -----
+//
+// 1. テクスチャチャンク (CHUNK_TEXTURE)
+//   uint32_t textureCount
+//   テクスチャごとに以下を繰り返す
+//     uint32_t type       // TextureType enum
+//     uint32_t size       // DDS データサイズ
+//     uint8_t[size] data  // DDS 本体データ
+//
+// 2. マテリアルチャンク (CHUNK_MATERIAL)
+//   uint32_t materialCount
+//   Material[materialCount] // MaterialInfo 構造体配列
+//
+// 3. メッシュチャンク (CHUNK_MESH)
+//   uint32_t meshCount
+//   MeshInfo[meshCount] // MeshInfo 構造体配列
+//
+// 4. 頂点チャンク (CHUNK_VERTEX)
+//   uint32_t vertexCount
+//   VertexPositionNormalTextureTangent[vertexCount] // 頂点配列
+//
+// 5. インデックスチャンク(CHUNK_INDEX)
+//   uint32_t indexCount
+//   uint32_t[indexCount] // インデックス配列
+//
+// ------------------------------------------------------------ //
+
+#include <iostream>
+#include <windows.h>
+#include <wrl.h>
+#include <vector>
+#include <fstream>
+#include <string>
+#include <unordered_map>
+#include <d3d11.h>
+#include "DirectXTex.h"
+#include "cxxopts.hpp"
+#include "ChunkIO.h"
+#include "BinaryWriter.h"
+#include "Imdl.h"
+
+using namespace DirectX;
+using namespace Imase;
+
+#pragma comment(lib, "d3d11.lib")
+
+// 面の各頂点を構成するインデックス
+struct FaceIndex
+{
+    int v;  // 位置
+    int vt; // テクスチャ座標
+    int vn; // 法線
+
+    bool operator==(const FaceIndex& other) const
+    {
+        return v == other.v && vt == other.vt && vn == other.vn;
+    }
+};
+
+// ハッシュ値を生成する関数
+namespace std
+{
+    template <>
+    struct hash<FaceIndex>
+    {
+        size_t operator()(const FaceIndex& f) const
+        {
+            size_t h1 = std::hash<int>()(f.v);
+            size_t h2 = std::hash<int>()(f.vt);
+            size_t h3 = std::hash<int>()(f.vn);
+
+            // ハッシュ合成
+            return h1 ^ (h2 << 1) ^ (h3 << 2);
+        }
+    };
+}
+
+// 面（三角形）
+struct Face
+{
+    FaceIndex faceIndices[3];
+};
+
+// サブメッシュ
+struct SubMesh
+{
+    std::string material;       // マテリアル名
+    std::vector<Face> faces;    // 面（三角形）情報
+};
+
+// メッシュ
+struct Mesh
+{
+    std::vector<SubMesh> subMeshs;  // サブメッシュ
+};
+
+// obj形式の情報取得用構造体
+struct Object
+{
+    std::string mtllib;                         // マテリアルファイル名
+    std::vector<DirectX::XMFLOAT3> positions;   // 位置
+    std::vector<DirectX::XMFLOAT3> normals;     // 法線
+    std::vector<DirectX::XMFLOAT2> texcoords;   // テクスチャ座標
+    std::vector<Mesh> meshes;                   // メッシュ
+};
+
+// パス名付きファイル名のファイル名を取得する関数
+static std::string GetFileNameOnly(const std::string& path)
+{
+    return std::filesystem::path(path).filename().string();
+}
+
+// ファイルから読み込む関数（XMFLOAT2）
+static XMFLOAT2 ReadFloat2(std::istringstream& iss)
+{
+    XMFLOAT2 val = {};
+    iss >> val.x >> val.y;
+    return val;
+}
+
+// ファイルから読み込む関数（XMFLOAT3）
+static XMFLOAT3 ReadFloat3(std::istringstream& iss)
+{
+    XMFLOAT3 val = {};
+    iss >> val.x >> val.y >> val.z;
+    return val;
+}
+
+// UTF-16 → UTF-8 変換
+static std::string WStringToUtf8(const std::wstring& ws)
+{
+    int size = WideCharToMultiByte(
+        CP_UTF8, 0,
+        ws.c_str(), -1,
+        nullptr, 0,
+        nullptr, nullptr);
+
+    std::string result(size - 1, 0);
+
+    WideCharToMultiByte(
+        CP_UTF8, 0,
+        ws.c_str(), -1,
+        result.data(), size,
+        nullptr, nullptr);
+
+    return result;
+}
+
+// UTF-8 → UTF-16 変換
+static std::wstring StringToWString(const std::string& str)
+{
+    if (str.empty()) return std::wstring();
+
+    int size_needed = MultiByteToWideChar(
+        CP_UTF8,                // UTF-8
+        0,
+        str.c_str(),
+        (int)str.size(),
+        nullptr,
+        0);
+
+    std::wstring wstr(size_needed, 0);
+
+    MultiByteToWideChar(
+        CP_UTF8,
+        0,
+        str.c_str(),
+        (int)str.size(),
+        &wstr[0],
+        size_needed);
+
+    return wstr;
+}
+
+// ヘルプ表示
+static void Help()
+{
+    std::cout <<
+        "Usage:\n"
+        "  ObjToImdl <input.obj> [-o output.imdl]\n\n"
+        "Options:\n"
+        "  -o, --output <file>   Output file\n"
+        "  -h, --help            Show help\n";
+}
+
+// 引数から入力ファイル名と出力ファイル名を取得する関数
+static int AnalyzeOption(int argc, char* argv[], std::string& input, std::string& output)
+{
+    // cxxoptsで引数解析
+    cxxopts::Options options("ObjToMdl");
+    options.add_options()
+        ("input", "Input model file (.obj)",
+            cxxopts::value<std::string>())
+        ("o,output", "Output file",
+            cxxopts::value<std::string>())
+        ("h,help", "Show help");
+    options.parse_positional({ "input" });
+
+    try
+    {
+        auto result = options.parse(argc, argv);
+
+        // -h,--help 指定された
+        if (result.count("help"))
+        {
+            Help();
+            return 0;
+        }
+
+        // 入力ファイル名
+        input = result["input"].as<std::string>();
+
+        // -o,-output 出力ファイル名
+        if (result.count("output") == 0) {
+            // 指定されていない場合は出力ファイル名は、入力ファイル名.mdlにする
+            std::filesystem::path p(input);
+            p.replace_extension(".imdl");
+            output = p.string();
+        }
+        else
+        {
+            // 指定された
+            output = result["output"].as<std::string>();
+        }
+    }
+    catch (const std::exception& e)
+    {
+        std::cerr << "Error: " << e.what() << std::endl;
+        Help();
+        return 1;
+    }
+
+    return 0;
+}
+
+// 面の各頂点を構成するインデックス取得関数
+static std::vector<FaceIndex> ParseFaceLine(const std::string& line, Object& object)
+{
+    auto fixIndex = [&](int raw, int size) {
+        if (raw > 0)  return raw - 1;
+        if (raw < 0)  return size + raw;
+        throw std::runtime_error("OBJ index cannot be zero");
+    };
+
+    std::istringstream iss(line);
+
+    std::string type;
+    iss >> type; // "f"
+
+    std::vector<FaceIndex> result;
+
+    std::string token;
+    while (iss >> token)
+    {
+        FaceIndex idx{ -1, -1, -1 };
+
+        std::istringstream tss(token);
+        std::string s;
+
+        // v
+        if (std::getline(tss, s, '/')) idx.v = fixIndex(std::stoi(s), static_cast<int>(object.positions.size()));
+
+        // vt
+        if (std::getline(tss, s, '/'))
+        {
+            if (!s.empty()) idx.vt = fixIndex(std::stoi(s), static_cast<int>(object.texcoords.size()));
+        }
+
+        // vn
+        if (std::getline(tss, s, '/'))
+        {
+            if (!s.empty()) idx.vn = fixIndex(std::stoi(s), static_cast<int>(object.normals.size()));
+        }
+
+        result.push_back(idx);
+    }
+
+    return result;
+}
+
+// objファイルの情報取得関数
+static int AnalyzeObj(const char* fname, Object& object)
+{
+    // objファイルのオープン
+    std::ifstream ifs(fname);
+
+    if (!ifs)
+    {
+        // ファイルのオープン失敗
+        std::cout << "Could not open " << fname << std::endl;
+        return 1;
+    }
+
+    std::vector<Face>* pFace = nullptr;
+    std::string object_name;
+
+    std::string line;
+    while (std::getline(ifs, line))
+    {
+        // 空行やコメントをスキップ
+        if (line.empty() || line[0] == '#') continue;
+
+        std::istringstream iss(line);
+
+        // 先頭のトークン
+        std::string type;
+        iss >> type;
+
+        // オブジェクト名
+        if (type == "o")
+        {
+            iss >> object_name;
+            object.meshes.emplace_back();
+            pFace = nullptr;
+        }
+
+        // 頂点
+        if (type == "v")
+        {
+            object.positions.push_back(ReadFloat3(iss));
+        }
+
+        // 法線
+        else if (type == "vn")
+        {
+            object.normals.push_back(ReadFloat3(iss));
+        }
+
+        // テクスチャ座標
+        else if (type == "vt")
+        {
+            // BlenderのV座標は上が＋
+            XMFLOAT2 uv = ReadFloat2(iss);
+            uv.y = 1.0f - uv.y;
+            object.texcoords.push_back(uv);
+        }
+
+        // 面情報
+        else if (type == "f")
+        {
+            // マテリアルがない
+            if (pFace == nullptr)
+            {
+                std::cout << object_name << " has no material assigned." << std::endl;
+                return 1;
+            }
+
+            // 面の各頂点を構成するインデックスを取得
+            std::vector<FaceIndex> result = ParseFaceLine(line, object);
+
+            // 四角形の場合は三角形２枚に置き換える
+            for (size_t i = 0; i < result.size() - 2; i++)
+            {
+                // 反時計回りが表
+                Face face{ result[0], result[i + 1], result[i + 2] };
+                pFace->push_back(face);
+            }
+        }
+
+        // マテリアル名
+        else if (type == "usemtl")
+        {
+            // メッシュを追加
+            object.meshes.back().subMeshs.emplace_back();
+
+            // マテリアル名
+            std::string material;
+            iss >> material;
+            object.meshes.back().subMeshs.back().material = material;
+
+            // 面を設定するポインタを更新
+            pFace = &object.meshes.back().subMeshs.back().faces;
+        }
+
+        // マテリアルファイル名
+        else if (type == "mtllib")
+        {
+            iss >> object.mtllib;
+        }
+    }
+
+    return 0;
+}
+
+// テクスチャタイプによる変換ファイルフォーマットを取得する関数
+static DXGI_FORMAT GetFormat(TextureType type)
+{
+    switch (type)
+    {
+    case TextureType::BaseColor:
+        return DXGI_FORMAT_BC7_UNORM_SRGB;
+
+    case TextureType::Normal:
+        return DXGI_FORMAT_BC5_UNORM;
+
+    case TextureType::MetalRough:
+        return DXGI_FORMAT_BC1_UNORM;
+
+    case TextureType::Emissive:
+        return DXGI_FORMAT_BC7_UNORM_SRGB;
+
+    default:
+        return DXGI_FORMAT_BC7_UNORM;
+    }
+}
+
+// テクスチャデータをDDS形式にしてメモリに書き出す関数
+// ※法線マップのみY要素を反転する（TexConvの-invertY相当）
+static HRESULT ConvertToDDSMemory(
+    ID3D11Device* device,
+    ScratchImage scratch,
+    size_t width,
+    size_t height,
+    TextureType type,
+    std::vector<uint8_t>& outDDS)
+{
+    HRESULT hr;
+
+    // ----------------------------------
+    // 1. 法線マップのみY反転（TexConv.exeの-inverty相当）
+    // ----------------------------------
+    if (type == TextureType::Normal)
+    {
+        ScratchImage flipped;
+
+        auto invertY = [](XMVECTOR* outPixels, const XMVECTOR* inPixels, size_t width, size_t y) noexcept
+            {
+                for (size_t x = 0; x < width; ++x)
+                {
+                    XMVECTOR v = inPixels[x];
+
+                    // G成分反転
+                    v = XMVectorSetY(v, 1.0f - XMVectorGetY(v));
+
+                    outPixels[x] = v;
+                }
+            };
+
+        HRESULT hr = TransformImage(
+            scratch.GetImages(),
+            scratch.GetImageCount(),
+            scratch.GetMetadata(),
+            invertY,
+            flipped);
+
+        scratch = std::move(flipped);
+    }
+
+    // ----------------------------------
+    // 2. ミップ生成
+    // ----------------------------------
+    ScratchImage mipChain;
+
+    hr = GenerateMipMaps(
+        scratch.GetImages(),
+        scratch.GetImageCount(),
+        scratch.GetMetadata(),
+        TEX_FILTER_FANT,
+        0,
+        mipChain);
+
+    if (FAILED(hr))
+        return hr;
+
+    // ----------------------------------
+    // 3. GPU圧縮
+    // ----------------------------------
+    ScratchImage compressed;
+
+    DXGI_FORMAT format = GetFormat(type);
+    if (type == TextureType::Normal)
+    {
+        hr = Compress(
+            mipChain.GetImages(),
+            mipChain.GetImageCount(),
+            mipChain.GetMetadata(),
+            DXGI_FORMAT_BC5_UNORM,
+            TEX_COMPRESS_DEFAULT,
+            TEX_THRESHOLD_DEFAULT,
+            compressed);
+    }
+    else
+    {
+        hr = Compress(
+            device,
+            mipChain.GetImages(),
+            mipChain.GetImageCount(),
+            mipChain.GetMetadata(),
+            format,
+            TEX_COMPRESS_DEFAULT,
+            0.5f,
+            compressed);
+    }
+
+    if (FAILED(hr))
+        return hr;
+
+    // ----------------------------------
+    // 4. メモリ内にDDS生成
+    // ----------------------------------
+    Blob ddsBlob;
+
+    hr = SaveToDDSMemory(
+        compressed.GetImages(),
+        compressed.GetImageCount(),
+        compressed.GetMetadata(),
+        DDS_FLAGS_NONE,
+        ddsBlob);
+
+    if (FAILED(hr))
+        return hr;
+
+    // ----------------------------------
+    // 5. vector にコピー
+    // ----------------------------------
+    outDDS.resize(ddsBlob.GetBufferSize());
+    memcpy(outDDS.data(),
+        ddsBlob.GetBufferPointer(),
+        ddsBlob.GetBufferSize());
+
+    return S_OK;
+}
+
+// テクスチャをDDSに変換して登録する関数
+static int RegisterTexture(
+    ID3D11Device* device,
+    std::string fname,
+    TextureType type,
+    std::vector<TextureEntry>& textures,
+    std::map<std::pair<std::string, TextureType>, int>& textureIndexMap)
+{
+    auto key = std::make_pair(fname, type);
+
+    // 既に登録済み？
+    auto it = textureIndexMap.find(key);
+    if (it != textureIndexMap.end())
+    {
+        return it->second;
+    }
+
+    // ----- テクスチャの読み込み→DDSの変換→登録 ----- //
+    ScratchImage image;
+    TexMetadata metadata;
+
+    std::wstring wfname = StringToWString(fname);
+
+    // PNG読み込み（WIC使用）
+    HRESULT hr = LoadFromWICFile(wfname.c_str(), WIC_FLAGS_NONE, &metadata, image);
+
+    // 読み込み失敗
+    if (FAILED(hr))
+        return -1;
+
+    // DDSへ変換
+    std::vector<uint8_t> dds;
+    hr = ConvertToDDSMemory(device, std::move(image), metadata.width, metadata.height, type, dds);
+
+    // 変換失敗
+    if (FAILED(hr))
+        return -1;
+
+    int newIndex = (int)textures.size();
+
+    textures.push_back({ type, dds });
+    textureIndexMap[key] = newIndex;
+
+    return newIndex;
+}
+
+// mtlファイルの情報取得関数
+static int AnalyzeMtl( ID3D11Device* device,
+                       const char* fname,
+                       std::vector<MaterialInfo>& materials,
+                       std::unordered_map<std::string, uint32_t>& materialIndexMap,
+                       std::vector<TextureEntry>& textures )
+{
+    // mtlファイルのオープン
+    std::ifstream ifs(fname);
+
+    if (!ifs)
+    {
+        // ファイルのオープン失敗
+        std::cout << "Could not open " << fname << std::endl;
+        return 1;
+    }
+
+    // テクスチャ登録位置を保存するコンテナ
+    std::map<std::pair<std::string, TextureType>, int> textureIndexMap;
+
+    uint32_t m_index = 0;
+    int32_t t_index = 0;
+
+    std::string line;
+    while (std::getline(ifs, line))
+    {
+        // 空行やコメントをスキップ
+        if (line.empty() || line[0] == '#') continue;
+
+        std::istringstream iss(line);
+
+        // 先頭のトークン
+        std::string type;
+        iss >> type;
+
+        // マテリアルファイル名
+        if (type == "newmtl")
+        {
+            std::string name;
+            iss >> name;
+            materials.resize(materials.size() + 1);
+            materialIndexMap[name] = m_index;
+            m_index++;
+        }
+
+        // ディフューズ色
+        else if (type == "Kd")
+        {
+            XMFLOAT3 color = ReadFloat3(iss);
+            materials.back().diffuseColor = { color.x, color.y, color.z, 1.0f};
+        }
+
+        // スペキュラ色
+        else if (type == "Ks")
+        {
+            // メタリックにIORレベルを入れる（プログラム側ではスペキュラ色の要素として使用）
+            // （blenderではメタリックはNsで出力されるのでroughnessへ反映）
+            XMFLOAT3 specularColor = ReadFloat3(iss);
+            materials.back().metallicFactor = specularColor.x;
+        }
+
+        // スペキュラパワー
+        else if (type == "Ns")
+        {
+            float Ns;
+            iss >> Ns;
+            // ※blenderの粗さ【roughness】はobj形式には反映されない
+            // blenderではNsの値はメタリックが反映される
+            // Ns = 1000 x (1 - metallic)^2
+            // Nsを使ってroughnessを算出する
+            // シェダー側では【spcularPower = 1000 x (1 - roughness)^2】で計算
+            float roughness = 1.0f - (sqrtf(Ns / 1000.0f));
+            materials.back().roughnessFactor = roughness;
+        }
+
+        // エミッシブ色
+        else if (type == "Ke")
+        {
+            materials.back().emissiveColor = ReadFloat3(iss);
+        }
+
+        // テクスチャ（ベースカラー）
+        else if (type == "map_Kd")
+        {
+            if (!materials.empty())
+            {
+                // 最後のトークンをファイル名として取得
+                std::string token, name;
+                while (iss >> token)
+                {
+                    name = token;
+                }
+                // エラー
+                if (name.empty()) return -1;
+                // テクスチャ登録
+                materials.back().baseColorTexIndex = RegisterTexture(
+                    device, GetFileNameOnly(name), TextureType::BaseColor, textures, textureIndexMap);
+            }
+        }
+
+        // テクスチャ（法線マップ）
+        else if (type == "map_Bump")
+        {
+            if (!materials.empty())
+            {
+                // 最後のトークンをファイル名として取得
+                std::string token, name;
+                while (iss >> token)
+                {
+                    name = token;
+                }
+                // エラー
+                if (name.empty()) return -1;
+                // テクスチャ登録
+                materials.back().normalTexIndex = RegisterTexture(
+                    device, GetFileNameOnly(name), TextureType::Normal, textures, textureIndexMap);
+            }
+        }
+    }
+
+    return 0;
+}
+
+// 頂点データ作成関数
+static VertexPositionNormalTextureTangent MakeVertex(Object& object, const FaceIndex& face)
+{
+    VertexPositionNormalTextureTangent v = {};
+
+    v.position = object.positions[face.v];
+
+    if (face.vn >= 0)
+    {
+        // 法線を正規化
+        XMVECTOR n = XMLoadFloat3(&object.normals[face.vn]);
+        n = XMVector3Normalize(n);
+        XMStoreFloat3(&v.normal, n);
+    }
+    else
+    {
+        // ダミー
+        v.normal = XMFLOAT3(0.0f, 0.0f, 1.0f);
+    }
+
+    v.texcoord = (face.vt >= 0) ? object.texcoords[face.vt] : XMFLOAT2(0.0f, 0.0f);
+
+    return v;
+}
+
+// メッシュデータから頂点バッファ、インデックスバッファ用のデータを作成する関数
+static void CreateBufferData( Object& object, 
+                              std::unordered_map<std::string, uint32_t>& materialIndexMap,
+                              std::vector<MeshInfo>& meshInfo,
+                              std::vector<VertexPositionNormalTextureTangent>& vertexBuffer,
+                              std::vector<uint32_t>& indexBuffer )
+{
+    std::unordered_map<FaceIndex, uint32_t> indexMap;
+
+    for (auto& mesh : object.meshes)
+    {
+        for (auto& subMesh : mesh.subMeshs)
+        {
+            // サブメッシュ情報
+            MeshInfo data = {};
+            auto it = materialIndexMap.find(subMesh.material);
+            if (it == materialIndexMap.end()) throw std::runtime_error("Material not found: " + subMesh.material);
+            data.materialIndex = it->second;                                // マテリアルインデックス
+            data.startIndex = static_cast<uint32_t>(indexBuffer.size());    // スタートインデックス
+            data.primCount = static_cast<uint32_t>(subMesh.faces.size());   // プリミティブ数
+            meshInfo.push_back(data);
+
+            for (auto& face : subMesh.faces)
+            {
+                for (int i = 0; i < 3; i++)
+                {
+                    auto it = indexMap.find(face.faceIndices[i]);
+
+                    if (it == indexMap.end())
+                    {
+                        // 新規頂点
+                        uint32_t newIndex = static_cast<uint32_t>(vertexBuffer.size());
+                        indexMap[face.faceIndices[i]] = newIndex;
+
+                        vertexBuffer.push_back(MakeVertex(object, face.faceIndices[i]));
+                        indexBuffer.push_back(newIndex);
+                    }
+                    else
+                    {
+                        // 既存頂点
+                        indexBuffer.push_back(it->second);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// テクスチャデータ作成
+static std::vector<uint8_t> BuildTextureChunk(const std::vector<TextureEntry>& textures)
+{
+    BinaryWriter writer;
+
+    writer.WriteUInt32(static_cast<uint32_t>(textures.size()));
+
+    for (const auto& tex : textures)
+    {
+        writer.WriteUInt32(static_cast<uint32_t>(tex.type));
+        writer.WriteUInt32(static_cast<uint32_t>(tex.data.size()));
+        writer.WriteBytes(tex.data.data(), tex.data.size());
+    }
+
+    return writer.GetBuffer();
+}
+
+// マテリアル情報のシリアライズ関数
+inline void SerializeMaterial(BinaryWriter& writer, const MaterialInfo& m)
+{
+    writer.WriteFloat(m.diffuseColor.x);
+    writer.WriteFloat(m.diffuseColor.y);
+    writer.WriteFloat(m.diffuseColor.z);
+    writer.WriteFloat(m.diffuseColor.w);
+
+    writer.WriteFloat(m.metallicFactor);
+    writer.WriteFloat(m.roughnessFactor);
+
+    writer.WriteFloat(m.emissiveColor.x);
+    writer.WriteFloat(m.emissiveColor.y);
+    writer.WriteFloat(m.emissiveColor.z);
+
+    writer.WriteInt32(m.baseColorTexIndex);
+    writer.WriteInt32(m.normalTexIndex);
+    writer.WriteInt32(m.metalRoughTexIndex);
+    writer.WriteInt32(m.emissiveTexIndex);
+}
+
+// マテリアル情報データ作成
+static std::vector<uint8_t> BuildMaterialChunk(const std::vector<MaterialInfo>& materials)
+{
+    BinaryWriter writer;
+
+    writer.WriteUInt32(static_cast<uint32_t>(materials.size()));
+
+    for (const auto& m : materials)
+    {
+        SerializeMaterial(writer, m);
+    }
+
+    return writer.GetBuffer();
+}
+
+// メッシュ情報のシリアライズ関数
+inline void SerializeMesh(BinaryWriter& writer, const MeshInfo& m)
+{
+    writer.WriteUInt32(m.startIndex);
+    writer.WriteUInt32(m.primCount);
+    writer.WriteUInt32(m.materialIndex);
+}
+
+// メッシュ情報データ作成
+static std::vector<uint8_t> BuildMeshChunk(const std::vector<MeshInfo>& meshes)
+{
+    BinaryWriter writer;
+
+    writer.WriteUInt32(static_cast<uint32_t>(meshes.size()));
+
+    for (const auto& m : meshes)
+    {
+        SerializeMesh(writer, m);
+    }
+
+    return writer.GetBuffer();
+}
+
+// 頂点データのシリアライズ関数
+inline void SerializeVertex(BinaryWriter& writer, const VertexPositionNormalTextureTangent& v)
+{
+    writer.WriteFloat(v.position.x);
+    writer.WriteFloat(v.position.y);
+    writer.WriteFloat(v.position.z);
+
+    writer.WriteFloat(v.normal.x);
+    writer.WriteFloat(v.normal.y);
+    writer.WriteFloat(v.normal.z);
+
+    writer.WriteFloat(v.texcoord.x);
+    writer.WriteFloat(v.texcoord.y);
+
+    writer.WriteFloat(v.tangent.x);
+    writer.WriteFloat(v.tangent.y);
+    writer.WriteFloat(v.tangent.z);
+    writer.WriteFloat(v.tangent.w);
+}
+
+// 頂点データ作成
+static std::vector<uint8_t> BuildVertexChunk(
+    const std::vector<VertexPositionNormalTextureTangent>& vertices)
+{
+    BinaryWriter writer;
+
+    writer.WriteUInt32(static_cast<uint32_t>(vertices.size()));
+
+    for (const auto& v : vertices)
+    {
+        SerializeVertex(writer, v);
+    }
+
+    return writer.GetBuffer();
+}
+
+// インデックスデータ作成
+static std::vector<uint8_t> BuildIndexChunk(const std::vector<uint32_t>& indices)
+{
+    BinaryWriter writer;
+    writer.WriteVector(indices);
+    return writer.GetBuffer();
+}
+
+// ファイルへの出力関数
+static int OutputImdl( const char* fname,
+                       std::vector<MaterialInfo>& materials,
+                       std::vector<MeshInfo>& meshInfo,
+                       std::vector<TextureEntry>& textures,
+                       std::vector<VertexPositionNormalTextureTangent>& vertexBuffer,
+                       std::vector<uint32_t>& indexBuffer )
+{
+    // 出力ファイルオープン
+    std::ofstream ofs(fname, std::ios::binary);
+
+    if (!ofs.is_open())
+    {
+        std::cout << "Could not open " << fname << std::endl;
+        return 1;
+    }
+
+    // ----- Header ----- //
+    FileHeader fileHeader{};
+    fileHeader.magic = 'IMDL';
+    fileHeader.version = 1;
+    fileHeader.chunkCount = 5;
+
+    ofs.write((char*)&fileHeader, sizeof(fileHeader));
+
+    // ----- Texture ----- //
+    WriteChunk(ofs, CHUNK_TEXTURE, BuildTextureChunk(textures));
+
+    // ----- Material ----- //
+    WriteChunk(ofs, CHUNK_MATERIAL, BuildMaterialChunk(materials));
+
+    // ----- Mesh ----- //
+    WriteChunk(ofs, CHUNK_MESH, BuildMeshChunk(meshInfo));
+
+    // ----- Vertex ----- //
+    WriteChunk(ofs, CHUNK_VERTEX, BuildVertexChunk(vertexBuffer));
+
+    // ----- Index ----- //
+    WriteChunk(ofs, CHUNK_INDEX, BuildIndexChunk(indexBuffer));
+
+    return 0;
+}
+
+// パス名を取得する関数
+static std::string GetDirectoryPath(const std::string& filepath)
+{
+    std::filesystem::path p(filepath);
+    return p.parent_path().string();
+}
+
+// パス名とファイル名を結合する関数
+static std::string JoinPath(const std::string& path, const std::string& filename)
+{
+    std::filesystem::path p(path);
+    p /= filename;   // パス結合
+    return p.string();
+}
+
+// 頂点データに接線を追加する関数
+static void GenerateTangents(
+    std::vector<VertexPositionNormalTextureTangent>& vertices,
+    const std::vector<uint32_t>& indices)
+{
+    std::vector<XMFLOAT3> tanAccum(vertices.size(), { 0,0,0 });
+    std::vector<XMFLOAT3> bitanAccum(vertices.size(), { 0,0,0 });
+
+    auto add = [&](uint32_t idx, const XMFLOAT3& t, const XMFLOAT3& b)
+        {
+            tanAccum[idx].x += t.x;
+            tanAccum[idx].y += t.y;
+            tanAccum[idx].z += t.z;
+
+            bitanAccum[idx].x += b.x;
+            bitanAccum[idx].y += b.y;
+            bitanAccum[idx].z += b.z;
+        };
+
+    auto set = [&](uint32_t idx, const XMFLOAT3& t, const XMFLOAT3& b)
+        {
+            tanAccum[idx] = t;
+            bitanAccum[idx] = b;
+        };
+
+    // 三角形の各頂点の法線が同じ向きならフラットシェーディングの面と判定
+    auto isFlatFace = [&](uint32_t i0, uint32_t i1, uint32_t i2)
+        {
+            XMVECTOR n0 = XMLoadFloat3(&vertices[i0].normal);
+            XMVECTOR n1 = XMLoadFloat3(&vertices[i1].normal);
+            XMVECTOR n2 = XMLoadFloat3(&vertices[i2].normal);
+
+            float d01 = XMVectorGetX(XMVector3Dot(n0, n1));
+            float d12 = XMVectorGetX(XMVector3Dot(n1, n2));
+
+            return d01 > 0.999f && d12 > 0.999f;
+        };
+
+    // ---- 三角形ごと ----
+    for (size_t i = 0; i + 2 < indices.size(); i += 3)
+    {
+        uint32_t i0 = indices[i + 0];
+        uint32_t i1 = indices[i + 1];
+        uint32_t i2 = indices[i + 2];
+
+        auto& v0 = vertices[i0];
+        auto& v1 = vertices[i1];
+        auto& v2 = vertices[i2];
+
+        XMVECTOR p0 = XMLoadFloat3(&v0.position);
+        XMVECTOR p1 = XMLoadFloat3(&v1.position);
+        XMVECTOR p2 = XMLoadFloat3(&v2.position);
+
+        float du1 = v1.texcoord.x - v0.texcoord.x;
+        float dv1 = v1.texcoord.y - v0.texcoord.y;
+        float du2 = v2.texcoord.x - v0.texcoord.x;
+        float dv2 = v2.texcoord.y - v0.texcoord.y;
+
+        float denom = du1 * dv2 - du2 * dv1;
+        if (fabs(denom) < 1e-6f)
+            continue;
+
+        float f = 1.0f / denom;
+
+        XMVECTOR e1 = p1 - p0;
+        XMVECTOR e2 = p2 - p0;
+
+        XMVECTOR T = (e1 * dv2 - e2 * dv1) * f;
+        XMVECTOR B = (e2 * du1 - e1 * du2) * f;
+
+        XMFLOAT3 t, b;
+        XMStoreFloat3(&t, T);
+        XMStoreFloat3(&b, B);
+
+        bool flat = isFlatFace(i0, i1, i2);
+
+        if (flat)
+        {
+            // フラット：上書き
+            set(i0, t, b);
+            set(i1, t, b);
+            set(i2, t, b);
+        }
+        else
+        {
+            // スムーズ：加算
+            add(i0, t, b);
+            add(i1, t, b);
+            add(i2, t, b);
+        }
+    }
+
+    // ---- 正規化 & handedness ----
+    for (size_t i = 0; i < vertices.size(); i++)
+    {
+        XMVECTOR N = XMLoadFloat3(&vertices[i].normal);
+        XMVECTOR T = XMLoadFloat3(&tanAccum[i]);
+        XMVECTOR B = XMLoadFloat3(&bitanAccum[i]);
+
+        T = XMVector3Normalize(T - N * XMVector3Dot(N, T));
+
+        float w = (XMVectorGetX(
+            XMVector3Dot(XMVector3Cross(N, T), B)) < 0.0f)
+            ? -1.0f : 1.0f;
+
+        XMFLOAT3 t;
+        XMStoreFloat3(&t, T);
+        vertices[i].tangent = { t.x, t.y, t.z, w };
+    }
+}
+
+// DirectXのデバイスを作成する関数
+static void CreateD3DDevice(ID3D11Device** device)
+{
+    D3D_FEATURE_LEVEL featureLevel;
+
+    HRESULT hr = D3D11CreateDevice(
+        nullptr,                    // アダプタ
+        D3D_DRIVER_TYPE_HARDWARE,   // GPU使用
+        nullptr,
+        0,
+        nullptr,
+        0,
+        D3D11_SDK_VERSION,
+        device,
+        &featureLevel,
+        nullptr
+    );
+
+    if (FAILED(hr))
+    {
+        // ハードウェアが無理ならWARP
+        hr = D3D11CreateDevice(
+            nullptr,
+            D3D_DRIVER_TYPE_WARP,
+            nullptr,
+            0,
+            nullptr,
+            0,
+            D3D11_SDK_VERSION,
+            device,
+            &featureLevel,
+            nullptr
+        );
+    }
+}
+
+// メイン
+int wmain(int argc, wchar_t* wargv[])
+{
+    HRESULT hr = CoInitializeEx(nullptr, COINITBASE_MULTITHREADED);
+    if (FAILED(hr))
+        return 1;
+
+    Microsoft::WRL::ComPtr<ID3D11Device> device;
+
+    // DirectXのデバイスを作成（テクスチャ圧縮で使用）
+    CreateD3DDevice(device.GetAddressOf());
+    std::vector<std::string> args;
+    std::vector<char*> argv;
+
+    // 文字コードをUTF-8へ変換する
+    for (int i = 0; i < argc; ++i)
+    {
+        args.push_back(WStringToUtf8(wargv[i]));
+    }
+
+    for (auto& s : args)
+    {
+        argv.push_back(s.data());
+    }
+
+    std::string input, output;
+
+    // 入力ファイル名と出力ファイル名を取得
+    if (AnalyzeOption(argc, argv.data(), input, output)) return 1;
+
+    // ----- 情報取得 ----- //
+
+    Object object;
+
+    // objファイルの情報取得
+    if (AnalyzeObj(input.c_str(), object)) return 1;
+
+    // mtlファイルの情報取得
+    object.mtllib = JoinPath(GetDirectoryPath(input), object.mtllib);
+
+    // マテリアルを取得
+    std::vector<MaterialInfo> materials;
+    std::unordered_map<std::string, uint32_t> materialIndexMap;
+    std::vector<TextureEntry> textures;
+    if (AnalyzeMtl(device.Get(), object.mtllib.c_str(), materials, materialIndexMap, textures)) return 1;
+
+    // 頂点、インデックスを取得
+    std::vector<MeshInfo> meshInfo;
+    std::vector<VertexPositionNormalTextureTangent> vertexBuffer;
+    std::vector<uint32_t> indexBuffer;
+    CreateBufferData(object, materialIndexMap, meshInfo, vertexBuffer, indexBuffer);
+
+    // 頂点データに接線を追加
+    GenerateTangents(vertexBuffer, indexBuffer);
+
+    // ----- 書き出し ----- //
+
+    if (OutputImdl(output.c_str(), materials, meshInfo, textures, vertexBuffer, indexBuffer)) return 1;
+
+    CoUninitialize();
+
+    return 0;
+}
