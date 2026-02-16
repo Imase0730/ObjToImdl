@@ -1,5 +1,11 @@
-﻿// ObjToIma.cpp : このファイルには 'main' 関数が含まれています。プログラム実行の開始と終了がそこで行われます。
-// wavefront形式のファイルを独自形式のモデルデータに変換するツール
+﻿//--------------------------------------------------------------------------------------
+// File: ObjToImdl.cpp
+//
+// wavefront形式のファイルを独自形式のモデルデータ(.imdl)に変換するツール
+//
+// Date: 2026.2.17
+// Author: Hideyasu Imase
+//--------------------------------------------------------------------------------------
 
 // ------------------------------------------------------------ //
 // モデルデータフォーマット
@@ -95,7 +101,7 @@ struct Face
 // サブメッシュ
 struct SubMesh
 {
-    std::string material;       // マテリアル名
+    std::string material;      // マテリアル名
     std::vector<Face> faces;    // 面（三角形）情報
 };
 
@@ -108,7 +114,7 @@ struct Mesh
 // obj形式の情報取得用構造体
 struct Object
 {
-    std::string mtllib;                         // マテリアルファイル名
+    std::filesystem::path mtllib;               // マテリアルファイル名
     std::vector<DirectX::XMFLOAT3> positions;   // 位置
     std::vector<DirectX::XMFLOAT3> normals;     // 法線
     std::vector<DirectX::XMFLOAT2> texcoords;   // テクスチャ座標
@@ -116,9 +122,9 @@ struct Object
 };
 
 // パス名付きファイル名のファイル名を取得する関数
-static std::string GetFileNameOnly(const std::string& path)
+static std::wstring GetFileNameOnly(const std::wstring& path)
 {
-    return std::filesystem::path(path).filename().string();
+    return std::filesystem::path(path).filename().wstring();
 }
 
 // ファイルから読み込む関数（XMFLOAT2）
@@ -195,7 +201,7 @@ static void Help()
 }
 
 // 引数から入力ファイル名と出力ファイル名を取得する関数
-static int AnalyzeOption(int argc, char* argv[], std::string& input, std::string& output)
+static int AnalyzeOption(int argc, char* argv[], std::filesystem::path& input, std::filesystem::path& output)
 {
     // cxxoptsで引数解析
     cxxopts::Options options("ObjToMdl");
@@ -219,19 +225,18 @@ static int AnalyzeOption(int argc, char* argv[], std::string& input, std::string
         }
 
         // 入力ファイル名
-        input = result["input"].as<std::string>();
+        input = std::filesystem::u8path(result["input"].as<std::string>());
 
         // -o,-output 出力ファイル名
         if (result.count("output") == 0) {
             // 指定されていない場合は出力ファイル名は、入力ファイル名.mdlにする
-            std::filesystem::path p(input);
-            p.replace_extension(".imdl");
-            output = p.string();
+            output = std::filesystem::path(input);
+            output.replace_extension(".imdl");
         }
         else
         {
             // 指定された
-            output = result["output"].as<std::string>();
+            output = std::filesystem::u8path(result["output"].as<std::string>());
         }
     }
     catch (const std::exception& e)
@@ -290,7 +295,7 @@ static std::vector<FaceIndex> ParseFaceLine(const std::string& line, Object& obj
 }
 
 // objファイルの情報取得関数
-static int AnalyzeObj(const char* fname, Object& object)
+static int AnalyzeObj(const std::filesystem::path& fname, Object& object)
 {
     // objファイルのオープン
     std::ifstream ifs(fname);
@@ -298,7 +303,7 @@ static int AnalyzeObj(const char* fname, Object& object)
     if (!ifs)
     {
         // ファイルのオープン失敗
-        std::cout << "Could not open " << fname << std::endl;
+        std::wcout << "Could not open " << fname << std::endl;
         return 1;
     }
 
@@ -386,7 +391,10 @@ static int AnalyzeObj(const char* fname, Object& object)
         // マテリアルファイル名
         else if (type == "mtllib")
         {
-            iss >> object.mtllib;
+            std::string name;
+            iss >> name;
+            // utf8 → path
+            object.mtllib = std::filesystem::u8path(name);
         }
     }
 
@@ -535,12 +543,12 @@ static HRESULT ConvertToDDSMemory(
 // テクスチャをDDSに変換して登録する関数
 static int RegisterTexture(
     ID3D11Device* device,
-    std::string fname,
+    const std::filesystem::path& path,
     TextureType type,
     std::vector<TextureEntry>& textures,
-    std::map<std::pair<std::string, TextureType>, int>& textureIndexMap)
+    std::map<std::pair<std::wstring, TextureType>, int>& textureIndexMap)
 {
-    auto key = std::make_pair(fname, type);
+    auto key = std::make_pair(path.c_str(), type);
 
     // 既に登録済み？
     auto it = textureIndexMap.find(key);
@@ -553,10 +561,8 @@ static int RegisterTexture(
     ScratchImage image;
     TexMetadata metadata;
 
-    std::wstring wfname = StringToWString(fname);
-
     // PNG読み込み（WIC使用）
-    HRESULT hr = LoadFromWICFile(wfname.c_str(), WIC_FLAGS_NONE, &metadata, image);
+    HRESULT hr = LoadFromWICFile(path.c_str(), WIC_FLAGS_NONE, &metadata, image);
 
     // 読み込み失敗
     if (FAILED(hr))
@@ -578,25 +584,58 @@ static int RegisterTexture(
     return newIndex;
 }
 
+// テクスチャファイル名の取得関数（オプションなどは除去）
+static std::string ExtractTextureFilename(std::istringstream& iss)
+{
+    std::string rest;
+    std::getline(iss >> std::ws, rest);
+
+    // オプション除去
+    std::istringstream optStream(rest);
+    std::string token;
+    std::string filename;
+
+    while (optStream >> token)
+    {
+        if (token[0] == '-')
+        {
+            optStream >> token; // オプション値をスキップ
+        }
+        else
+        {
+            filename = token;
+            std::string remain;
+            std::getline(optStream, remain);
+            filename += remain;
+            break;
+        }
+    }
+
+    // 先頭のタブを除去
+    filename.erase(0, filename.find_first_not_of(" \t"));
+
+    return filename;
+}
+
 // mtlファイルの情報取得関数
 static int AnalyzeMtl( ID3D11Device* device,
-                       const char* fname,
+                       const std::filesystem::path& path,
                        std::vector<MaterialInfo>& materials,
                        std::unordered_map<std::string, uint32_t>& materialIndexMap,
                        std::vector<TextureEntry>& textures )
 {
     // mtlファイルのオープン
-    std::ifstream ifs(fname);
+    std::ifstream ifs(path.c_str());
 
     if (!ifs)
     {
         // ファイルのオープン失敗
-        std::cout << "Could not open " << fname << std::endl;
+        std::wcout << "Could not open " << path.c_str() << std::endl;
         return 1;
     }
 
     // テクスチャ登録位置を保存するコンテナ
-    std::map<std::pair<std::string, TextureType>, int> textureIndexMap;
+    std::map<std::pair<std::wstring, TextureType>, int> textureIndexMap;
 
     uint32_t m_index = 0;
     int32_t t_index = 0;
@@ -665,16 +704,31 @@ static int AnalyzeMtl( ID3D11Device* device,
             if (!materials.empty())
             {
                 // 最後のトークンをファイル名として取得
-                std::string token, name;
-                while (iss >> token)
-                {
-                    name = token;
-                }
+                std::string name = ExtractTextureFilename(iss);
+
                 // エラー
                 if (name.empty()) return -1;
+
+                // utf8 → path
+                std::filesystem::path p = std::filesystem::u8path(name);
+
+                // pngファイルが存在？
+                if (!std::filesystem::exists(p))
+                {
+                    // 存在しない場合はobjと一緒のフォルダに変更
+                    std::filesystem::path baseDir = path.parent_path();
+                    p = baseDir / p.filename();
+                    // そこにもpngがない
+                    if (!std::filesystem::exists(p))
+                    {
+                        std::wcerr << L"Texture not found: " << p.wstring() << std::endl;
+                        return -1;
+                    }
+                }
+
                 // テクスチャ登録
                 materials.back().baseColorTexIndex = RegisterTexture(
-                    device, GetFileNameOnly(name), TextureType::BaseColor, textures, textureIndexMap);
+                    device, p, TextureType::BaseColor, textures, textureIndexMap);
             }
         }
 
@@ -684,16 +738,30 @@ static int AnalyzeMtl( ID3D11Device* device,
             if (!materials.empty())
             {
                 // 最後のトークンをファイル名として取得
-                std::string token, name;
-                while (iss >> token)
-                {
-                    name = token;
-                }
+                std::string name = ExtractTextureFilename(iss);
+                
                 // エラー
                 if (name.empty()) return -1;
+
+                // utf8 → path
+                std::filesystem::path p = std::filesystem::u8path(name);
+
+                // pngファイルが存在？
+                if (!std::filesystem::exists(p))
+                {
+                    // 存在しない場合はobjと一緒のフォルダに変更
+                    std::filesystem::path baseDir = path.parent_path();
+                    p = baseDir / p.filename();
+                    // そこにもpngがない
+                    if (!std::filesystem::exists(p))
+                    {
+                        std::wcerr << L"Texture not found: " << p.wstring() << std::endl;
+                        return -1;
+                    }
+                }
                 // テクスチャ登録
                 materials.back().normalTexIndex = RegisterTexture(
-                    device, GetFileNameOnly(name), TextureType::Normal, textures, textureIndexMap);
+                    device, p, TextureType::Normal, textures, textureIndexMap);
             }
         }
     }
@@ -895,7 +963,7 @@ static std::vector<uint8_t> BuildIndexChunk(const std::vector<uint32_t>& indices
 }
 
 // ファイルへの出力関数
-static int OutputImdl( const char* fname,
+static int OutputImdl( const std::filesystem::path& path,
                        std::vector<MaterialInfo>& materials,
                        std::vector<MeshInfo>& meshInfo,
                        std::vector<TextureEntry>& textures,
@@ -903,11 +971,11 @@ static int OutputImdl( const char* fname,
                        std::vector<uint32_t>& indexBuffer )
 {
     // 出力ファイルオープン
-    std::ofstream ofs(fname, std::ios::binary);
+    std::ofstream ofs(path.c_str(), std::ios::binary);
 
     if (!ofs.is_open())
     {
-        std::cout << "Could not open " << fname << std::endl;
+        std::wcout << "Could not open " << path.c_str() << std::endl;
         return 1;
     }
 
@@ -935,21 +1003,6 @@ static int OutputImdl( const char* fname,
     WriteChunk(ofs, CHUNK_INDEX, BuildIndexChunk(indexBuffer));
 
     return 0;
-}
-
-// パス名を取得する関数
-static std::string GetDirectoryPath(const std::string& filepath)
-{
-    std::filesystem::path p(filepath);
-    return p.parent_path().string();
-}
-
-// パス名とファイル名を結合する関数
-static std::string JoinPath(const std::string& path, const std::string& filename)
-{
-    std::filesystem::path p(path);
-    p /= filename;   // パス結合
-    return p.string();
 }
 
 // 頂点データに接線を追加する関数
@@ -1099,6 +1152,34 @@ static void CreateD3DDevice(ID3D11Device** device)
     }
 }
 
+// パス付きマテリアルファイル名を取得
+static bool GetMaterialPath(std::filesystem::path input, std::filesystem::path& mtlPath)
+{
+    if (mtlPath.empty())
+    {
+        std::wcerr << L"No mtllib specified in obj file." << std::endl;
+        return false;
+    }
+
+    // 相対バスなら
+    if (mtlPath.is_relative())
+    {
+        // objの入っているフォルダのパスを付ける
+        mtlPath = input.parent_path() / mtlPath;
+    }
+
+    mtlPath = mtlPath.lexically_normal();  // 文字列レベルで正規化
+
+    // mtlファイルが存在？
+    if (!std::filesystem::exists(mtlPath))
+    {
+        std::wcerr << L"Material not found: " << mtlPath << std::endl;
+        return false;
+    }
+
+    return true;
+}
+
 // メイン
 int wmain(int argc, wchar_t* wargv[])
 {
@@ -1124,7 +1205,7 @@ int wmain(int argc, wchar_t* wargv[])
         argv.push_back(s.data());
     }
 
-    std::string input, output;
+    std::filesystem::path input, output;
 
     // 入力ファイル名と出力ファイル名を取得
     if (AnalyzeOption(argc, argv.data(), input, output)) return 1;
@@ -1132,18 +1213,22 @@ int wmain(int argc, wchar_t* wargv[])
     // ----- 情報取得 ----- //
 
     Object object;
+    std::string path;
 
     // objファイルの情報取得
-    if (AnalyzeObj(input.c_str(), object)) return 1;
+    if (AnalyzeObj(input, object)) return 1;
 
-    // mtlファイルの情報取得
-    object.mtllib = JoinPath(GetDirectoryPath(input), object.mtllib);
+    // パス付きマテリアルファイル名を取得
+    if (!GetMaterialPath(input, object.mtllib))
+    {
+        return -1;
+    }
 
     // マテリアルを取得
     std::vector<MaterialInfo> materials;
     std::unordered_map<std::string, uint32_t> materialIndexMap;
     std::vector<TextureEntry> textures;
-    if (AnalyzeMtl(device.Get(), object.mtllib.c_str(), materials, materialIndexMap, textures)) return 1;
+    if (AnalyzeMtl(device.Get(), object.mtllib, materials, materialIndexMap, textures)) return 1;
 
     // 頂点、インデックスを取得
     std::vector<MeshInfo> meshInfo;
@@ -1156,7 +1241,7 @@ int wmain(int argc, wchar_t* wargv[])
 
     // ----- 書き出し ----- //
 
-    if (OutputImdl(output.c_str(), materials, meshInfo, textures, vertexBuffer, indexBuffer)) return 1;
+    if (OutputImdl(output, materials, meshInfo, textures, vertexBuffer, indexBuffer)) return 1;
 
     CoUninitialize();
 
