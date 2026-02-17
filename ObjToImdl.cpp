@@ -1161,7 +1161,7 @@ static bool GetMaterialPath(std::filesystem::path input, std::filesystem::path& 
         return false;
     }
 
-    // 相対バスなら
+    // 相対パスなら
     if (mtlPath.is_relative())
     {
         // objの入っているフォルダのパスを付ける
